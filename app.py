@@ -8,6 +8,7 @@ except Exception:
         genai = _genai
     except Exception:
         genai = None
+
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from PIL import Image
@@ -16,13 +17,12 @@ import hashlib
 import tempfile
 import shutil
 import urllib.request
+import traceback
 
 # --- Local model (ai_model.h5) support ---
 local_model = None
 np = None
 
-# Defer heavy ML imports and model loading to runtime to avoid
-# double-initialization issues with Flask's reloader on Windows.
 def load_local_model():
     global local_model, np
     try:
@@ -34,20 +34,18 @@ def load_local_model():
         if os.path.exists(model_path):
             try:
                 local_model = load_model(model_path)
-                print('Loaded local model:', model_path)
+                print('✓ Loaded local model:', model_path)
             except Exception as e:
-                print('Failed loading local model:', e)
+                print('✗ Failed loading local model:', e)
         else:
-            print('Local model file not found at', model_path)
+            print('✗ Local model file not found at', model_path)
     except Exception as e:
-        print('TensorFlow not available or failed to import:', e)
+        print('✗ TensorFlow not available or failed to import:', e)
         local_model = None
 
 
 def ensure_model_present():
-    """If `ai_model.h5` is missing and the env var MODEL_URL is set, download it.
-    Optionally verify SHA256 with env var MODEL_SHA256.
-    """
+    """If `ai_model.h5` is missing and the env var MODEL_URL is set, download it."""
     model_path = os.path.join(os.path.dirname(__file__), 'ai_model.h5')
     if os.path.exists(model_path):
         print('Local model already present at', model_path)
@@ -71,7 +69,7 @@ def ensure_model_present():
                     h.update(chunk)
             actual = h.hexdigest()
             if actual.lower() != expected.lower():
-                print(f'SHA256 mismatch: expected {expected}, got {actual}; removing downloaded file')
+                print(f'SHA256 mismatch: expected {expected}, got {actual}')
                 try:
                     os.remove(tmp_path)
                 except Exception:
@@ -88,9 +86,9 @@ def ensure_model_present():
             pass
 
 app = Flask(__name__)
-CORS(app) # Cross-Origin Resource Sharing enable karne ke liye
+CORS(app)
 
-# Load detector configuration (threshold)
+# Load detector configuration
 THRESHOLD = 50
 try:
     import json
@@ -101,219 +99,243 @@ try:
             THRESHOLD = int(cfg.get('threshold', THRESHOLD))
             print('Loaded detector threshold from config:', THRESHOLD)
 except Exception as e:
-    print('No detector config found or failed to read, using default threshold', THRESHOLD)
+    print('No detector config found, using default threshold', THRESHOLD)
 
-# --- STEP 1: API KEY CONFIGURATION ---
-# Note: Maine wahi key rakhi hai jo tumne di thi
+# --- API KEY CONFIGURATION ---
+print('\n=== GEMINI API SETUP ===')
 if genai is not None:
+    print('✓ genai module imported')
     try:
-        # new and old libs expose different configuration methods; try common ones
+        API_KEY = os.environ.get('GENAI_API_KEY', "AIzaSyCCMIXEUXhuw6fvhQwoUq0UWqm1TEvuGWI")
         if hasattr(genai, 'configure'):
-            genai.configure(api_key="AIzaSyCCMIXEUXhuw6fvhQwoUq0UWqm1TEvuGWI")
+            genai.configure(api_key=API_KEY)
+            print('✓ Gemini API key configured via configure()')
         elif hasattr(genai, 'configure_client'):
-            genai.configure_client(api_key="AIzaSyCCMIXEUXhuw6fvhQwoUq0UWqm1TEvuGWI")
-    except Exception:
-        pass
+            genai.configure_client(api_key=API_KEY)
+            print('✓ Gemini API key configured via configure_client()')
+    except Exception as e:
+        print(f'✗ Failed to configure Gemini API key: {e}')
+else:
+    print('✗ genai module not imported - Gemini API will not be available')
 
-# Small health endpoint to verify server from other machines
 @app.route('/health', methods=['GET'])
 def health():
-    return jsonify({'status': 'ok'}), 200
+    return jsonify({'status': 'ok', 'genai_available': genai is not None}), 200
+
 
 @app.route('/analyze', methods=['POST'])
 def analyze():
     try:
-        # 1. Check if image is present
         if 'image' not in request.files:
             return jsonify({"error": "No image uploaded"}), 400
-        
         file = request.files['image']
         img = Image.open(file.stream).convert('RGB')
+        print(f'\nAnalyzing image: {file.filename}')
 
-        # 2. Gemini Model Initialize (Fixed Name)
-        # Do not return early when genai is missing — prefer local model if available.
-        if genai is None:
-            print('genai library not available on server — will try local model if present')
-
-        model = None
-        # 3. AI Scanning Instructions (Added JSON instruction for better parsing)
-        prompt = """
-        Analyze this image for digital forensics. 
-        Determine if it is AI-generated (Synthetic) or a real photograph (Authentic).
-        Provide the response in the following format:
-        Verdict: [AI or Real]
-        Confidence: [Percentage]
-        Comments: [One line technical observation]
-        """
-        # API call (wrap in try to log failures)
-        try:
-            # prefer constructing model if available on the client
-            if hasattr(genai, 'GenerativeModel'):
-                model = genai.GenerativeModel('gemini-1.5-flash')
-            elif hasattr(genai, 'Model'):
-                model = genai.Model('gemini-1.5-flash')
-
-            response = None
-            if model is not None and hasattr(model, 'generate_content'):
-                response = model.generate_content([prompt, img])
-            else:
-                # try genai.generate if exposed differently
-                if hasattr(genai, 'generate'):
-                    response = genai.generate(prompt=prompt, image=img)
-
-            print('Raw model response object:', repr(response))
-
-            # extract text from known response shapes
-            result_text = ''
-            if response is None:
-                result_text = ''
-            elif hasattr(response, 'text'):
-                result_text = (response.text or '')
-            elif isinstance(response, dict) and 'text' in response:
-                result_text = response.get('text', '')
-            else:
-                result_text = str(response)
-
-            result_text = (result_text or '').lower()
-            print('Parsed result_text:', result_text)
-        except Exception as me:
-            print('Model call failed:', repr(me))
-            result_text = ''
-
-        # 4. Result Parsing (Simplified Logic)
-        is_ai = "ai" in result_text or "synthetic" in result_text
-        
-        # Confidence score nikalne ka safer tarika
-        confidence = 90
-        import re
-        nums = re.findall(r'\d+', result_text)
-        if nums:
-            # Pehla number jo mile use confidence maan lo agar wo valid hai
-            potential_score = int(nums[0])
-            if 50 <= potential_score <= 100:
-                confidence = potential_score
-
-        # AI ke observations nikalna naye box ke liye
-        comments = "No significant anomalies detected."
-        if result_text:
-            if "reason:" in result_text or "comments:" in result_text:
-                try:
-                    comments = result_text.split("reason:")[1].split("\n")[0].strip()
-                except:
-                    try:
-                        comments = result_text.split("comments:")[1].split("\n")[0].strip()
-                    except:
-                        pass
-        else:
-            # If no text returned from model, make confidence 0 and note it
-            confidence = 0
-            comments = "No output from model; returned default result."
-
-        # --- Local model inference (if ai_model.h5 loaded) ---
-        def run_local_model(pil_img):
+        # DEBUG: Metadata Found? [Yes/No]
+        def has_exif(pil_img):
             try:
-                if local_model is None or np is None:
-                    return None
-                # Standard preprocessing: resize to 224x224 and scale
-                arr = np.array(pil_img.resize((224,224))).astype('float32') / 255.0
-                if arr.ndim == 2:
-                    arr = np.stack([arr, arr, arr], axis=-1)
-                if arr.shape[-1] == 4:
-                    arr = arr[..., :3]
-                arr = np.expand_dims(arr, 0)
-                preds = local_model.predict(arr)
-                p = np.array(preds)
-                # Interpret prediction
-                if p.size == 1:
-                    prob = float(p.flatten()[0])
-                elif p.ndim == 2 and p.shape[1] > 1:
-                    prob = float(p[0,1])
-                else:
-                    prob = float(p.flatten()[0])
-                # if prob seems >1 or <0, treat as logit and sigmoid
-                if prob > 1 or prob < 0:
-                    try:
-                        prob = 1.0 / (1.0 + np.exp(-prob))
-                    except Exception:
-                        prob = max(0.0, min(1.0, prob))
-                conf = int(round(prob * 100))
-                return conf
-            except Exception as e:
-                print('Local model prediction failed:', e)
-                return None
+                exif = pil_img._getexif()
+                return bool(exif)
+            except Exception:
+                return False
 
+        meta_found = has_exif(img)
+        print(f'DEBUG: Metadata Found? [{"Yes" if meta_found else "No"}]')
+
+        # FORCE Metadata Check: If metadata exists, immediately return Real
+        if meta_found:
+            return jsonify({
+                'verdict': 'Real hai photo',
+                'confidence': 100,
+                'comments': 'Metadata found - trusted as real camera output',
+                'source': 'Metadata (Highest Priority)'
+            })
+
+        # FIX Scaling/Normalization: use img_to_array and divide by 255.0
+        normalized = None
         try:
-            local_conf = run_local_model(img)
-            if local_conf is not None:
-                # Prefer local model confidence when available
-                confidence = int(local_conf)
-                # Simple forensic heuristic to complement local model
-                def forensic_ai_score(pil_img):
-                    try:
-                        arr = np.array(pil_img.convert('L')).astype('float32')
-                        # Compute simple 3x3 Laplacian via neighbors
-                        padded = np.pad(arr, 1, mode='reflect')
-                        center = padded[1:-1,1:-1]
-                        up = padded[0:-2,1:-1]
-                        down = padded[2:,1:-1]
-                        left = padded[1:-1,0:-2]
-                        right = padded[1:-1,2:]
-                        lap = (4.0*center - up - down - left - right)
-                        hf = float(np.mean(np.abs(lap)))
-                        # normalize with heuristic bounds
-                        MIN_HF = 0.5
-                        MAX_HF = 60.0
-                        norm = (hf - MIN_HF) / (MAX_HF - MIN_HF)
-                        norm = max(0.0, min(1.0, norm))
-                        # lower high-frequency energy -> more likely AI
-                        ai_score = 1.0 - norm
-                        return ai_score
-                    except Exception as e:
-                        print('Forensic scoring failed:', e)
-                        return 0.5
-
-                try:
-                    forensic_score_val = forensic_ai_score(img)
-                    # Convert forensic score to percentage AI-likelihood
-                    forensic_pct = int(round(forensic_score_val * 100))
-                    # Combine local model confidence and forensic signal
-                    combined = int(round(0.75 * confidence + 0.25 * forensic_pct))
-                    print(f'Local_conf={confidence}, Forensic_pct={forensic_pct}, Combined={combined}')
-                    confidence = combined
-                    is_ai = confidence >= THRESHOLD
-                except Exception as e:
-                    print('Error combining forensic score:', e)
-                    is_ai = confidence >= THRESHOLD
-                # Note in comments that local model was used
-                comments = (comments + ' (local model)') if comments else 'Local model used.'
-        except Exception as e:
-            print('Error during local model inference:', e)
-
-        # Ensure confidence is numeric
-        try:
-            confidence = int(confidence)
+            # try Keras util first
+            try:
+                from tensorflow.keras.preprocessing.image import img_to_array
+                arr = img_to_array(img)
+            except Exception:
+                from keras.utils import img_to_array
+                arr = img_to_array(img)
+            import numpy as _np
+            normalized = arr.astype('float32') / 255.0
         except Exception:
-            confidence = 0
+            # fallback to numpy
+            import numpy as _np
+            arr = _np.array(img).astype('float32')
+            normalized = arr / 255.0
 
-        return jsonify({
-            "verdict": "AI SYNTHETIC" if is_ai else "AUTHENTIC",
-            "confidence": confidence,
-            "comments": comments.capitalize(),
-            "metadata": "API Cloud Verified" if not is_ai else "AI Signature Detected",
-            "spectral": "Deep Scanning Active",
-            "compression": "Consistent" if not is_ai else "Inconsistent"
-        })
+        vmin = float(normalized.min())
+        vmax = float(normalized.max())
+        print(f'DEBUG: Normalized Value: [{vmin:.6f}/{vmax:.6f}]')
 
+        # Stage 2: Heuristic watermark check (used as a decisive negative signal)
+        def watermark_check(pil_img):
+            try:
+                w,h = pil_img.size
+                import numpy as _np
+                corners = [ (0,0,w//6,h//6), (w - w//6,0,w,h//6), (0,h - h//6,w//6,h), (w - w//6,h - h//6,w,h) ]
+                for (x1,y1,x2,y2) in corners:
+                    crop = pil_img.crop((x1,y1,x2,y2)).convert('L')
+                    arrc = _np.array(crop).astype('float32')
+                    gx = _np.abs(_np.diff(arrc, axis=1)).mean()
+                    gy = _np.abs(_np.diff(arrc, axis=0)).mean()
+                    edge_density = (gx+gy)/2.0
+                    dark_ratio = (arrc < arrc.mean()*0.6).sum() / arrc.size
+                    if edge_density > 8.0 or dark_ratio > 0.25:
+                        return True, {'edge_density': float(edge_density), 'dark_ratio': float(dark_ratio)}
+                return False, None
+            except Exception as e:
+                print('Watermark check failed:', e)
+                return False, None
+
+        # Step 2: Gemini API
+        gemini_text = None
+        gemini_result = None
+        try:
+            if genai is None:
+                raise RuntimeError('genai not available')
+            # Try creating model with API key parameter if supported
+            API_KEY = os.environ.get('GENAI_API_KEY', None)
+            try:
+                if API_KEY is not None:
+                    try:
+                        model = genai.GenerativeModel('gemini-1.5-flash', api_key=API_KEY)
+                    except TypeError:
+                        # some genai versions don't accept api_key on constructor
+                        model = genai.GenerativeModel('gemini-1.5-flash')
+                else:
+                    model = genai.GenerativeModel('gemini-1.5-flash')
+            except Exception as e:
+                raise RuntimeError(f'Gemini model create failed: {e}')
+            prompt = 'Analyze this image for AI artifacts (fingers, textures, background distortion). Is it AI or Real? Give a final verdict.'
+            try:
+                resp = model.generate_content([prompt, img])
+            except Exception as e:
+                # Log the exact error and abort Gemini processing
+                print('Gemini generate_content failed:', type(e).__name__, e)
+                print(traceback.format_exc())
+                raise
+            if resp and hasattr(resp, 'text'):
+                gemini_text = resp.text.strip()
+            else:
+                gemini_text = str(resp)
+            print(f'DEBUG: Gemini Response: [{gemini_text}]')
+            # parse simple verdict/conf
+            import re
+            verdict = None
+            confidence = None
+            if gemini_text:
+                for line in gemini_text.split('\n'):
+                    l = line.lower().strip()
+                    if l.startswith('verdict:'):
+                        verdict = 'ai' if 'ai' in l else 'real'
+                    if l.startswith('confidence:'):
+                        nums = re.findall(r'\d+', l)
+                        if nums:
+                            confidence = int(nums[0])
+                if verdict is None:
+                    if 'synthetic' in gemini_text.lower() or 'ai' in gemini_text.lower():
+                        verdict = 'ai'
+                    elif 'real' in gemini_text.lower() or 'authentic' in gemini_text.lower():
+                        verdict = 'real'
+                if confidence is None:
+                    nums = re.findall(r'\d+', gemini_text)
+                    if nums:
+                        confidence = int(nums[0])
+                if confidence is None:
+                    confidence = 50
+                confidence = max(0, min(100, int(confidence)))
+                gemini_result = {'verdict': verdict, 'confidence': confidence, 'raw': gemini_text}
+        except Exception as e:
+            gemini_text = f'Gemini error: {type(e).__name__}: {e}'
+            gemini_result = None
+            print(f'DEBUG: Gemini Response: [{gemini_text}]')
+
+        # If Gemini succeeded with a decisive confidence, accept it
+        if gemini_result and gemini_result.get('verdict') and gemini_result.get('confidence') is not None:
+            gc = gemini_result['confidence']
+            gv = gemini_result['verdict']
+            # decisive thresholds
+            if gc >= 60:
+                return jsonify({'verdict': 'AI hai photo', 'confidence': gc, 'comments': 'Gemini decisive AI', 'source': 'Gemini'})
+            if gc <= 40:
+                return jsonify({'verdict': 'Real hai photo', 'confidence': gc, 'comments': 'Gemini decisive Real', 'source': 'Gemini'})
+
+        # If Gemini failed or inconclusive, check watermark before defaulting Real
+        wm_flag, wm_info = watermark_check(img)
+        if wm_flag:
+            print('Watermark-like pattern detected:', wm_info)
+            return jsonify({'verdict': 'AI hai photo', 'confidence': 95, 'comments': 'Watermark-like pattern detected', 'source': 'Watermark Heuristic'})
+
+        # If Gemini inconclusive but available, use local model as backup (ensure correct scaling)
+        local_conf = None
+        if gemini_result is not None and (40 < gemini_result.get('confidence',50) < 60):
+            try:
+                # Use img_to_array normalization already computed in `normalized`
+                import numpy as _np
+                inp = _np.array(normalized)
+                if inp.ndim == 2:
+                    inp = _np.stack([inp, inp, inp], axis=-1)
+                if inp.shape[-1] == 4:
+                    inp = inp[..., :3]
+                inp = _np.expand_dims(inp, 0)
+                if local_model is not None:
+                    preds = local_model.predict(inp, verbose=0)
+                    p = _np.array(preds)
+                    if p.size == 1:
+                        prob = float(p.flatten()[0])
+                    elif p.ndim == 2 and p.shape[1] > 1:
+                        prob = float(p[0,1])
+                    else:
+                        prob = float(p.flatten()[0])
+                    if prob > 1 or prob < 0:
+                        prob = 1.0 / (1.0 + _np.exp(-prob))
+                    local_conf = int(round(max(0.0, min(1.0, prob)) * 100))
+                    print(f'DEBUG: Local model confidence: [{local_conf}]')
+            except Exception as e:
+                print('Local model fallback failed:', e)
+
+        # If local model provided a result, combine 80% Gemini + 20% local
+        if gemini_result and local_conf is not None:
+            combined = int(round(0.8 * gemini_result['confidence'] + 0.2 * local_conf))
+            verdict = 'AI hai photo' if combined >= THRESHOLD else 'Real hai photo'
+            return jsonify({'verdict': verdict, 'confidence': combined, 'comments': 'Combined Gemini+Local', 'source': 'Combined'})
+
+        # If Gemini failed entirely or was unavailable, do NOT return a fake score.
+        if gemini_result is None:
+            # If watermark was found earlier, we already returned AI. Otherwise, surface an explicit error.
+            err_details = gemini_text or 'Gemini produced no output'
+            print('ERROR: Gemini unavailable or failed:', err_details)
+            return jsonify({'error': 'Gemini unavailable or failed', 'details': err_details}), 503
+
+        # Last resort: return Gemini's (non-decisive) result
+        if gemini_result:
+            gv = gemini_result.get('verdict')
+            gc = gemini_result.get('confidence', 50)
+            return jsonify({'verdict': 'AI hai photo' if gv == 'ai' else 'Real hai photo', 'confidence': gc, 'comments': 'Gemini inconclusive', 'source': 'Gemini'})
+
+        return jsonify({'error': 'Unhandled path', 'source': 'None'}), 500
     except Exception as e:
-        print(f"Error details: {str(e)}")
-        return jsonify({"error": f"Internal Error: {str(e)}"}), 500
+        print('Analyze endpoint error:', e)
+        print(traceback.format_exc())
+        return jsonify({'error': str(e)}), 500
+
 
 if __name__ == '__main__':
-    # Attempt to download model at startup if requested via env vars,
-    # then load local model once in the main process (avoids reloader double-init)
     ensure_model_present()
     load_local_model()
-    print("Gemini AI Engine Starting on http://0.0.0.0:8000")
-    # Bind to all interfaces so other devices on the network can reach it
-    # Run with threading to handle occasional longer model inferences
+    print("\n" + "="*60)
+    print("🚀 AI DETECTOR SERVICE STARTING")
+    print("="*60)
+    print("Primary: Gemini 1.5 Flash API")
+    print("Fallback: Local TensorFlow Model (ai_model.h5)")
+    print("Server: http://0.0.0.0:8000")
+    print("="*60 + "\n")
+    
     app.run(host='0.0.0.0', port=8000, debug=False, use_reloader=False, threaded=True)
