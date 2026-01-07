@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+env/
+venv/
+.venv/
+.idea/
+.vscode/
+build/
+dist/
+*.egg-info/
+# Don't ignore model files (ai_model.h5) — include them if present
+# Add OS specific files
+Thumbs.db
+.DS_Store

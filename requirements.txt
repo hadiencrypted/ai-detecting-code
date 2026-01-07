@@ -1,0 +1,7 @@
+flask
+flask-cors
+pillow
+numpy
+tensorflow
+# Optional: google genai clients if you plan to use Gemini cloud API
+# google-genai
